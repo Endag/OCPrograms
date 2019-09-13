@@ -1,0 +1,276 @@
+PORT_GPS = 8192
+local vector = {}
+local _vector = {
+  add = function( self, o )
+  return vector.new(
+  self.x + o.x,
+  self.y + o.y,
+  self.z + o.z
+  )
+  end,
+  sub = function( self, o )
+  return vector.new(
+  self.x - o.x,
+  self.y - o.y,
+  self.z - o.z
+  )
+  end,
+  mul = function( self, m )
+  return vector.new(
+  self.x * m,
+  self.y * m,
+  self.z * m
+  )
+  end,
+  dot = function( self, o )
+  return self.x*o.x + self.y*o.y + self.z*o.z
+  end,
+  cross = function( self, o )
+  return vector.new(
+  self.y*o.z - self.z*o.y,
+  self.z*o.x - self.x*o.z,
+  self.x*o.y - self.y*o.x
+  )
+  end,
+  length = function( self )
+  return math.sqrt( self.x*self.x + self.y*self.y + self.z*self.z )
+  end,
+  normalize = function( self )
+  return self:mul( 1 / self:length() )
+  end,
+  round = function( self, nTolerance )
+  nTolerance = nTolerance or 1.0
+  return vector.new(
+  math.floor( (self.x + (nTolerance * 0.5)) / nTolerance ) * nTolerance,
+  math.floor( (self.y + (nTolerance * 0.5)) / nTolerance ) * nTolerance,
+  math.floor( (self.z + (nTolerance * 0.5)) / nTolerance ) * nTolerance
+  )
+  end,
+  tostring = function( self )
+  return self.x..","..self.y..","..self.z
+  end,
+}
+
+local vmetatable = {
+  __index = _vector,
+  __add = _vector.add,
+  __sub = _vector.sub,
+  __mul = _vector.mul,
+  __unm = function( v ) return v:mul(-1) end,
+  __tostring = _vector.tostring,
+}
+
+function vector.new( x, y, z )
+  local v = {
+    x = x or 0,
+    y = y or 0,
+    z = z or 0
+  }
+  setmetatable( v, vmetatable )
+  return v
+end
+
+function trilaterate( A, B, C )
+  local a2b = B.p - A.p
+  local a2c = C.p - A.p
+
+  if math.abs( a2b:normalize():dot( a2c:normalize() ) ) > 0.999 then
+    return nil
+  end
+
+  local d = a2b:length()
+  local ex = a2b:normalize( )
+  local i = ex:dot( a2c )
+  local ey = (a2c - (ex * i)):normalize()
+  local j = ey:dot( a2c )
+  local ez = ex:cross( ey )
+
+  local r1 = A.d
+  local r2 = B.d
+  local r3 = C.d
+
+  local x = (r1*r1 - r2*r2 + d*d) / (2*d)
+  local y = (r1*r1 - r3*r3 - x*x + (x-i)*(x-i) + j*j) / (2*j)
+
+  local result = A.p + (ex * x) + (ey * y)
+
+  local zSquared = r1*r1 - x*x - y*y
+  if zSquared > 0 then
+    local z = math.sqrt( zSquared )
+    local result1 = result + (ez * z)
+    local result2 = result - (ez * z)
+
+    local rounded1, rounded2 = result1:round( 0.01 ), result2:round( 0.01 )
+    if rounded1.x ~= rounded2.x or rounded1.y ~= rounded2.y or rounded1.z ~= rounded2.z then
+      return rounded1, rounded2
+    else
+      return rounded1
+    end
+  end
+  return result:round( 0.01 )
+end
+
+function narrow( p1, p2, fix )
+  local dist1 = math.abs( (p1 - fix.p):length() - fix.d )
+  local dist2 = math.abs( (p2 - fix.p):length() - fix.d )
+
+  --print(dist1 .." / " .. dist2)
+
+  if math.abs(dist1 - dist2) < 0.01 then
+    return p1, p2
+  elseif dist1 < dist2 then
+    return p1:round( 0.01 )
+  else
+    return p2:round( 0.01 )
+  end
+end
+
+function smartInsert(tbl, entry)
+  --print("Before " .. dump(tbl))
+  local added = false;
+  if #tbl > 0 then
+    for k,v in pairs(tbl) do
+      if v.src == entry.src then
+        tbl[k] = entry
+        added = true
+      end
+    end
+  end
+  if not added then
+    table.insert( tbl, entry )
+  end
+  -- print("After " .. dump(tbl))
+end
+
+
+function locate(timeout, modem)
+
+  modem = modem or m
+  timeout = timeout or 5
+  if modem == nil then
+    computer.beep(300)
+    return nil
+  end
+
+  modem.close()
+  modem.open(PORT_GPS)
+
+  if not modem.isOpen(PORT_GPS) then
+    print("error opening modem")
+    return nil
+  end
+
+  local fixes = {}
+  local pos1, pos2 = nil, nil
+
+  --print(dump(computer))
+  computer.beep(100)
+  while true do
+    local e = {computer.pullSignal(timeout)}
+    computer.beep(200)
+    if e[1] == "modem_message" then
+      -- We received a mm from a modem
+      local aa, from, port, d, header = table.unpack(e,2,6)
+      local mm = {table.unpack(e,7,#e)}
+      if header == "GPS" then
+        -- Received the correct mm from the correct modem: use it to determine p
+        if #mm == 3 then
+          local fix = { p = vector.new( mm[1], mm[2], mm[3] ), d = d, src = from }
+          if fix.d == 0 then
+            pos1, pos2 = fix.p, nil
+          else
+            smartInsert( fixes, fix )
+            if #fixes >= 3 then
+              if not pos1 then
+                pos1, pos2 = trilaterate( fixes[1], fixes[2], fixes[#fixes] )
+              else
+                pos1, pos2 = narrow( pos1, pos2, fix )
+              end
+            end
+          end
+          if pos1 and not pos2 then
+            break
+          end
+        end
+      end
+    elseif e[1] == nil then
+      break
+    end
+
+  end
+  modem.close( PORT_GPS )
+  -- Return the response
+  if pos1 and pos2 then
+    return nil
+  elseif pos1 then
+    return pos1.x, pos1.y, pos1.z
+  else
+    return nil
+  end
+
+end
+
+function dump(o)
+  if type(o) == 'table' then
+    local s = '{ '
+    for k,v in pairs(o) do
+      if type(k) ~= 'number' then k = '"'..k..'"' end
+      s = s .. '['..k..'] = ' .. dump(v) .. ','
+    end
+    return s .. '} '
+  else
+    return tostring(o)
+  end
+end
+
+function pos()
+  d.setLightColor(math.random(65535))
+  computer.beep(500)
+  local p = {locate(10,m)}
+  computer.beep(1000)
+  print(dump(p))
+  d.setStatusText(d.name())
+  computer.beep(2000)
+end
+
+function dist(v1,v2)
+local tv= v1-v2
+	return tv:length()
+end
+
+function gotogps(x,y,z)
+  local cx,cy,cz = locate(10,m)
+  local cur = vector.new(cx,cy,cz)
+  local dest = vector.new(x,y,z)
+  
+ if cx and cy and cz then
+    computer.beep(500)
+    computer.beep(600)
+    computer.beep(700)
+  while cx and dist(cur,dest) > 1 do 
+	print("Distance ".. dist(cur,dest))
+    local dx = x-cx
+    local dy = y-cy
+    local dz = z-cz
+
+    d.move(dx,dy,dz)
+	
+	while(d.getVelocity() > 0.1) do
+	sleep(0.5)
+	end
+	cx,cy,cz = locate(10,m)
+	cur = vector.new(cx,cy,cz)
+	end
+	
+    computer.beep(1000)
+    computer.beep(1200)
+    computer.beep(1400)
+
+  else
+    computer.beep(300)
+    computer.beep(200)
+    computer.beep(100)
+  end
+end
+
+print("drone gps loaded")
